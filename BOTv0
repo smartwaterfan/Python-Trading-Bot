@@ -1,0 +1,177 @@
+#Primitive Bot, gets current day values along with sentiment score using GPT 3.5 to determine a buy-sell
+
+import yfinance as yf
+import requests
+import os
+from datetime import datetime, timedelta
+from openai import OpenAI
+
+# ====== CONFIG ======
+ticker_symbol    = "TSLA"
+NEWS_API_KEY     = "NEWSAPIKEYHERE"
+OPENAI_API_KEY   = "OPENAIKEYHERE"
+client           = OpenAI(api_key=OPENAI_API_KEY)
+
+# ====== 1. PRICE DATA ======
+ticker        = yf.Ticker(ticker_symbol)
+today_data    = ticker.history(period="1d")
+current_price = today_data["Close"].iloc[-1]
+
+this_week_data = ticker.history(period="7d")
+this_week_high = this_week_data["High"].max()
+
+last_week_data = ticker.history(
+    start=(datetime.now() - timedelta(days=14)),
+    end  =(datetime.now() - timedelta(days=7))
+)
+last_week_high = last_week_data["High"].max()
+
+percent_drop = ((this_week_high - current_price) / this_week_high) * 100
+drop_score   = min(percent_drop / 10, 1)  # scale 0–1
+
+# ====== 2. FUNDAMENTALS ======
+info = ticker.info
+
+# -- Scoring functions --
+def score_pe(pe):
+    if not pe or pe <= 0: return 0
+    if pe < 10:    return 1
+    if pe < 20:    return 0.8
+    if pe < 30:    return 0.5
+    return 0.2
+
+def score_peg(peg):
+    if not peg or peg <= 0: return 0
+    if peg < 1:    return 1
+    if peg < 2:    return 0.5
+    return 0.2
+
+def score_pb(pb):
+    if not pb or pb <= 0: return 0
+    if pb < 1:    return 1
+    if pb < 3:    return 0.5
+    return 0.2
+
+def score_roe(roe):
+    if roe is None: return 0
+    if roe > 0.2:  return 1
+    if roe > 0.1:  return 0.5
+    return 0.2
+
+def score_de(de):
+    if de is None:       return 0
+    if de < 50:          return 1      # low debt-to-equity
+    if de < 100:         return 0.5
+    return 0.2
+
+# -- Fetch and score metrics --
+pe  = info.get("trailingPE")
+peg = info.get("pegRatio")
+pb  = info.get("priceToBook")
+roe = info.get("returnOnEquity")
+de  = info.get("debtToEquity")
+
+pe_score  = score_pe(pe)
+peg_score = score_peg(peg)
+pb_score  = score_pb(pb)
+roe_score = score_roe(roe)
+de_score  = score_de(de)
+
+# Average across 5 fundamentals
+fundamental_score = (pe_score + peg_score + pb_score + roe_score + de_score) / 5
+
+# ====== 3. NEWS & SENTIMENT ======
+def get_news_headlines(symbol, n=5):
+    url = (
+        f"https://newsapi.org/v2/everything?"
+        f"q={symbol}&sortBy=publishedAt&language=en"
+        f"&pageSize={n}&apiKey={NEWS_API_KEY}"
+    )
+    r = requests.get(url)
+    if r.status_code != 200:
+        return []
+    return [art["title"] for art in r.json().get("articles", [])]
+
+def analyze_sentiment(headlines):
+    # Ask GPT to rate each headline & give an average
+    prompt = (
+        "For each of these stock headlines, rate the sentiment:\n"
+        "-1 = negative, 0 = neutral, +1 = positive.\n"
+        "Respond in lines: '1: <score>', then at the end 'Average: <score>'.\n\n"
+    )
+    for i, h in enumerate(headlines, 1):
+        prompt += f"{i}. {h}\n"
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role":"user","content":prompt}],
+        temperature=0
+    )
+    reply = response.choices[0].message.content.strip()
+
+    # Parse return
+    raw_scores = {}
+    avg_raw = None
+    for line in reply.splitlines():
+        if ':' not in line:
+            continue
+        key, val = line.split(':', 1)
+        key = key.strip()
+        try:
+            score = float(val.strip())
+        except:
+            continue
+        if key.lower() == "average":
+            avg_raw = score
+        else:
+            idx = int(key)
+            raw_scores[idx] = score
+
+    # Fallback average
+    if avg_raw is None and raw_scores:
+        avg_raw = sum(raw_scores.values()) / len(raw_scores)
+
+    # Scale to [0,1]
+    scaled = (avg_raw + 1) / 2 if avg_raw is not None else 0.5
+    return raw_scores, avg_raw, scaled
+
+# Fetch & evaluate news
+headlines = get_news_headlines(ticker_symbol)
+scores_dict, avg_raw, sentiment_score = analyze_sentiment(headlines)
+
+# ====== 4. FINAL SCORE & DECISION ======
+final_score = (
+    0.3 * drop_score +
+    0.2 * pe_score +
+    0.3 * sentiment_score +
+    0.2 * fundamental_score
+)
+
+# ====== 5. OUTPUT ======
+print("===== Stock Evaluation =====")
+print(f"Ticker:            {ticker_symbol}")
+print(f"Current Price:     ${current_price:.2f}")
+print(f"This Week High:    ${this_week_high:.2f}")
+print(f"Last Week High:    ${last_week_high:.2f}")
+print(f"Drop from High:    {percent_drop:.2f}% → Drop Score: {drop_score:.2f}\n")
+
+print("🔎 Fundamentals:")
+print(f"P/E: {pe} → Score: {pe_score:.2f}")
+print(f"PEG: {peg} → Score: {peg_score:.2f}")
+print(f"P/B: {pb} → Score: {pb_score:.2f}")
+print(f"ROE: {roe} → Score: {roe_score:.2f}")
+print(f"D/E: {de} → Score: {de_score:.2f}")
+print(f"Fundamental Score (avg): {fundamental_score:.2f}\n")
+
+print("📰 News Headlines & Sentiment:")
+for i, hl in enumerate(headlines, 1):
+    score = scores_dict.get(i, 0)
+    print(f"{i}. {hl}\n   → Sentiment: {score}\n")
+print(f"Average Raw Sentiment: {avg_raw:.2f} → Scaled Score: {sentiment_score:.2f}\n")
+
+print(f"🧠 Final Decision Score: {final_score:.2f}")
+if final_score >= 0.6:
+    print("✅ Recommendation: BUY SIGNAL")
+elif final_score <= 0.4:
+    print("🚫 Recommendation: SELL or AVOID")
+else:
+    print("🟡 Recommendation: HOLD / NO ACTION")
